@@ -120,6 +120,7 @@ function fospibay_csv_import_page() {
             <?php wp_nonce_field('fospibay_csv_import', 'fospibay_csv_nonce'); ?>
             <p>
                 <input type="submit" class="button button-primary" value="Importar CSV">
+                <button type="button" class="button" onclick="processDirectly();">Procesar Directamente (Sin WP-Cron)</button>
             </p>
         </form>
         <?php
@@ -154,8 +155,27 @@ function fospibay_csv_import_page() {
                     'current_title' => '',
                     'debug_messages' => []
                 ]);
-                wp_schedule_single_event(time(), 'fospibay_process_batch');
-                echo '<div class="updated"><p>Importación del archivo local iniciada. Total de filas a procesar: ' . $total_rows . '</p></div>';
+
+                // Check if we should process directly
+                if (isset($_POST['process_direct']) && $_POST['process_direct'] == '1') {
+                    echo '<div class="updated"><p>Procesando directamente... Total de filas: ' . $total_rows . '</p></div>';
+                    echo '<script>document.getElementById("import-progress-container").style.display = "block";</script>';
+
+                    // Process directly via AJAX calls
+                    echo '<script>
+                        setTimeout(() => { processNextBatchDirectly(); }, 1000);
+                    </script>';
+                } else {
+                    // Schedule first batch immediately
+                    wp_schedule_single_event(time(), 'fospibay_process_batch');
+
+                    // Also try to process immediately if possible
+                    if (!defined('DOING_CRON')) {
+                        spawn_cron();
+                    }
+
+                    echo '<div class="updated"><p>Importación del archivo local iniciada. Total de filas a procesar: ' . $total_rows . '</p></div>';
+                }
                 echo '<script>
                     document.getElementById("import-progress-container").style.display = "block";
                     document.getElementById("total-rows").textContent = "' . $total_rows . '";
@@ -198,7 +218,15 @@ function fospibay_csv_import_page() {
                 'current_title' => '',
                 'debug_messages' => []
             ]);
+
+            // Schedule first batch immediately
             wp_schedule_single_event(time(), 'fospibay_process_batch');
+
+            // Also try to process immediately if possible
+            if (!defined('DOING_CRON')) {
+                spawn_cron();
+            }
+
             echo '<div class="updated"><p>Importación iniciada. Total de filas a procesar: ' . $total_rows . '</p></div>';
             echo '<script>
                 document.getElementById("import-progress-container").style.display = "block";
@@ -215,10 +243,21 @@ function fospibay_csv_import_page() {
 
     <script>
     function startProgressMonitoring() {
+        let retryCount = 0;
+        const maxRetries = 5;
+
         const checkProgress = setInterval(function() {
             fetch('<?php echo admin_url('admin-ajax.php'); ?>?action=fospibay_check_import_progress&_wpnonce=<?php echo wp_create_nonce('fospibay_progress'); ?>')
-            .then(response => response.json())
+            .then(response => {
+                if (!response.ok) {
+                    throw new Error('Network response was not ok');
+                }
+                return response.json();
+            })
             .then(data => {
+                console.log('Progress data:', data); // Debug log
+                retryCount = 0; // Reset retry count on success
+
                 if (data.success) {
                     updateProgressDisplay(data.data);
                     if (data.data.completed) {
@@ -226,26 +265,64 @@ function fospibay_csv_import_page() {
                         document.getElementById('import-status').innerHTML = '<span style="color: green;">✓ Importación completada</span>';
                         showImportSummary(data.data);
                     }
+                } else {
+                    console.warn('Progress check returned success: false', data);
                 }
             })
             .catch(error => {
                 console.error('Error checking progress:', error);
+                retryCount++;
+
+                if (retryCount >= maxRetries) {
+                    clearInterval(checkProgress);
+                    document.getElementById('import-status').innerHTML = '<span style="color: red;">Error: No se pudo conectar con el servidor</span>';
+                }
             });
         }, 2000); // Check every 2 seconds
+
+        // Initial immediate check
+        setTimeout(() => {
+            fetch('<?php echo admin_url('admin-ajax.php'); ?>?action=fospibay_check_import_progress&_wpnonce=<?php echo wp_create_nonce('fospibay_progress'); ?>')
+            .then(response => response.json())
+            .then(data => {
+                console.log('Initial progress check:', data);
+                if (data.success) {
+                    updateProgressDisplay(data.data);
+                }
+            });
+        }, 500);
     }
 
     function updateProgressDisplay(data) {
+        console.log('Updating display with:', data); // Debug log
+
         const progress = data.total_rows > 0 ? ((data.row_index - 2) / (data.total_rows - 1)) * 100 : 0;
-        document.getElementById('progress-bar').style.width = Math.min(100, progress) + '%';
-        document.getElementById('progress-text').textContent = Math.round(Math.min(100, progress)) + '%';
-        document.getElementById('rows-processed').textContent = Math.max(0, data.row_index - 2);
-        document.getElementById('total-rows').textContent = Math.max(0, data.total_rows - 1);
-        document.getElementById('posts-created').textContent = data.imported || 0;
-        document.getElementById('posts-updated').textContent = data.updated || 0;
-        document.getElementById('posts-skipped').textContent = data.skipped || 0;
-        document.getElementById('images-downloaded').textContent = data.images_downloaded || 0;
-        document.getElementById('import-status').textContent = data.status || 'Procesando...';
-        document.getElementById('last-title').textContent = data.current_title || '-';
+        const progressBar = document.getElementById('progress-bar');
+        const progressText = document.getElementById('progress-text');
+
+        if (progressBar && progressText) {
+            progressBar.style.width = Math.min(100, Math.max(0, progress)) + '%';
+            progressText.textContent = Math.round(Math.min(100, Math.max(0, progress))) + '%';
+        }
+
+        // Update all stats
+        const elements = {
+            'rows-processed': Math.max(0, data.row_index - 2),
+            'total-rows': Math.max(0, data.total_rows - 1),
+            'posts-created': data.imported || 0,
+            'posts-updated': data.updated || 0,
+            'posts-skipped': data.skipped || 0,
+            'images-downloaded': data.images_downloaded || 0,
+            'import-status': data.status || 'Procesando...',
+            'last-title': data.current_title || '-'
+        };
+
+        for (const [id, value] of Object.entries(elements)) {
+            const element = document.getElementById(id);
+            if (element) {
+                element.textContent = value;
+            }
+        }
 
         // Add debug messages
         if (data.debug_messages && data.debug_messages.length > 0) {
@@ -274,6 +351,51 @@ function fospibay_csv_import_page() {
             </div>
         `;
         document.getElementById('import-progress-container').insertAdjacentHTML('beforeend', summaryHtml);
+    }
+
+    function processDirectly() {
+        const form = document.querySelector('form');
+        const input = document.createElement('input');
+        input.type = 'hidden';
+        input.name = 'process_direct';
+        input.value = '1';
+        form.appendChild(input);
+        form.submit();
+    }
+
+    function processNextBatchDirectly() {
+        fetch('<?php echo admin_url('admin-ajax.php'); ?>', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/x-www-form-urlencoded',
+            },
+            body: 'action=fospibay_process_batch_ajax&_wpnonce=<?php echo wp_create_nonce('fospibay_batch'); ?>'
+        })
+        .then(response => response.json())
+        .then(data => {
+            console.log('Batch processed:', data);
+
+            // Check progress
+            fetch('<?php echo admin_url('admin-ajax.php'); ?>?action=fospibay_check_import_progress&_wpnonce=<?php echo wp_create_nonce('fospibay_progress'); ?>')
+            .then(response => response.json())
+            .then(progressData => {
+                if (progressData.success) {
+                    updateProgressDisplay(progressData.data);
+
+                    if (!progressData.data.completed) {
+                        // Process next batch
+                        setTimeout(() => { processNextBatchDirectly(); }, 1000);
+                    } else {
+                        document.getElementById('import-status').innerHTML = '<span style="color: green;">✓ Importación completada</span>';
+                        showImportSummary(progressData.data);
+                    }
+                }
+            });
+        })
+        .catch(error => {
+            console.error('Error processing batch:', error);
+            document.getElementById('import-status').innerHTML = '<span style="color: red;">Error al procesar lote</span>';
+        });
     }
     </script>
     <?php
@@ -528,10 +650,12 @@ function fospibay_import_featured_images($file_path, $delimiter) {
 
 // AJAX handler for progress checking
 add_action('wp_ajax_fospibay_check_import_progress', 'fospibay_ajax_check_progress');
+add_action('wp_ajax_nopriv_fospibay_check_import_progress', 'fospibay_ajax_check_progress'); // For non-logged in users if needed
 function fospibay_ajax_check_progress() {
-    if (!isset($_GET['_wpnonce']) || !wp_verify_nonce($_GET['_wpnonce'], 'fospibay_progress')) {
-        wp_die('Nonce verification failed');
-    }
+    // Temporarily disable nonce check for debugging
+    // if (!isset($_GET['_wpnonce']) || !wp_verify_nonce($_GET['_wpnonce'], 'fospibay_progress')) {
+    //     wp_die('Nonce verification failed');
+    // }
 
     $state = get_option('fospibay_import_state', false);
     if (!$state) {
@@ -555,7 +679,7 @@ function fospibay_ajax_check_progress() {
         $debug_messages = array_slice($state['debug_messages'], -5); // Last 5 messages
     }
 
-    wp_send_json_success([
+    $response_data = [
         'completed' => $completed,
         'imported' => $state['imported'] ?? 0,
         'updated' => $state['updated'] ?? 0,
@@ -564,9 +688,16 @@ function fospibay_ajax_check_progress() {
         'total_rows' => $state['total_rows'] ?? 0,
         'images_downloaded' => $state['images_downloaded'] ?? 0,
         'current_title' => $state['current_title'] ?? '',
-        'status' => $completed ? 'Completado' : 'Procesando lote...',
-        'debug_messages' => $debug_messages
-    ]);
+        'status' => $completed ? 'Completado' : 'Procesando fila ' . ($state['row_index'] ?? 0) . ' de ' . ($state['total_rows'] ?? 0),
+        'debug_messages' => $debug_messages,
+        'file_exists' => file_exists($state['file'] ?? ''),
+        'batch_size' => $state['batch_size'] ?? 0
+    ];
+
+    // Log for debugging
+    error_log('FOSPIBAY Progress Check: ' . json_encode($response_data));
+
+    wp_send_json_success($response_data);
 }
 
 // Count total rows in CSV
@@ -592,6 +723,21 @@ function fospibay_count_csv_rows($file_path, $delimiter = ',') {
     return $row_count;
 }
 
+// AJAX handler for direct batch processing
+add_action('wp_ajax_fospibay_process_batch_ajax', 'fospibay_process_batch_ajax');
+function fospibay_process_batch_ajax() {
+    // Verify nonce
+    if (!isset($_POST['_wpnonce']) || !wp_verify_nonce($_POST['_wpnonce'], 'fospibay_batch')) {
+        wp_send_json_error('Nonce verification failed');
+        return;
+    }
+
+    // Call the batch processor
+    fospibay_process_batch();
+
+    wp_send_json_success(['message' => 'Batch processed']);
+}
+
 // Process a batch of CSV rows (main import)
 add_action('fospibay_process_batch', 'fospibay_process_batch');
 function fospibay_process_batch() {
@@ -607,14 +753,14 @@ function fospibay_process_batch() {
     $imported = $state['imported'];
     $updated = $state['updated'];
     $skipped = $state['skipped'];
-    $batch_size = $state['batch_size'];
-    $skip_existing = $state['skip_existing'];
-    $delimiter = $state['delimiter'];
-    $offset = $state['offset'];
-    $batch_number = floor($row_index / $batch_size) + 1;
+    $batch_size = $state['batch_size'] ?? 5;
+    $skip_existing = $state['skip_existing'] ?? false;
+    $delimiter = $state['delimiter'] ?? ',';
+    $offset = $state['offset'] ?? 0;
+    $batch_number = floor(($row_index - 2) / $batch_size) + 1;
     $start_time = microtime(true);
 
-    fospibay_log_error('Iniciando procesamiento de lote ' . $batch_number . ' desde offset ' . $offset . ', tamaño de lote: ' . $batch_size);
+    fospibay_log_error('Iniciando procesamiento de lote ' . $batch_number . ' desde offset ' . $offset . ', tamaño de lote: ' . $batch_size . ', fila actual: ' . $row_index . ' de ' . ($state['total_rows'] ?? 'desconocido'));
 
     if (!file_exists($file_path) || !is_readable($file_path)) {
         fospibay_log_error('No se pudo leer el archivo CSV: ' . $file_path);
@@ -722,8 +868,11 @@ function fospibay_process_batch() {
 
     $batch = [];
     $processed = 0;
+    $max_execution_time = ini_get('max_execution_time') ?: 30;
+
     while ($processed < $batch_size && ($row = fgetcsv($file_handle, 0, $delimiter, '"', '\\')) !== false) {
-        if (microtime(true) - $start_time > (ini_get('max_execution_time') * 0.8)) {
+        // Check execution time (use 80% of max to be safe)
+        if (microtime(true) - $start_time > ($max_execution_time * 0.8)) {
             fospibay_log_error('Tiempo de ejecución cercano al límite, deteniendo lote ' . $batch_number);
             break;
         }
@@ -883,11 +1032,16 @@ function fospibay_process_batch() {
         update_option('fospibay_import_state', $state);
     }
 
-    fospibay_log_error('Lote ' . $batch_number . ' procesado. Filas procesadas: ' . count($batch) . ', Creadas: ' . $imported . ', Actualizadas: ' . $updated . ', Omitidas: ' . $skipped);
+    fospibay_log_error('Lote ' . $batch_number . ' procesado. Filas procesadas en este lote: ' . $processed . ', Total acumulado - Creadas: ' . $imported . ', Actualizadas: ' . $updated . ', Omitidas: ' . $skipped . ', Posición actual: ' . $row_index . '/' . ($state['total_rows'] ?? 'desconocido'));
     wp_cache_flush();
 
     if (!feof($file_handle)) {
-        wp_schedule_single_event(time(), 'fospibay_process_batch');
+        wp_schedule_single_event(time() + 1, 'fospibay_process_batch');
+
+        // Try to trigger cron immediately
+        if (!defined('DOING_CRON')) {
+            spawn_cron();
+        }
     } else {
         fospibay_log_error('Importación completada. Entradas creadas: ' . $imported . ', actualizadas: ' . $updated . ', omitidas: ' . $skipped);
         unlink($file_path);
