@@ -11,6 +11,28 @@ if (!defined('ABSPATH')) {
     exit;
 }
 
+// Enqueue admin scripts
+add_action('admin_enqueue_scripts', 'fospibay_enqueue_admin_scripts');
+function fospibay_enqueue_admin_scripts($hook) {
+    // Only load on our plugin pages
+    if (strpos($hook, 'fospibay') !== false) {
+        // Register and enqueue the JavaScript file
+        wp_enqueue_script(
+            'fospibay-import-script',
+            plugins_url('fix-import.js', __FILE__),
+            array('jquery'),
+            '1.0.0',
+            true // Load in footer
+        );
+
+        // Pass AJAX URL to JavaScript
+        wp_localize_script('fospibay-import-script', 'fospibay_ajax', array(
+            'ajax_url' => admin_url('admin-ajax.php'),
+            'nonce' => wp_create_nonce('fospibay_ajax_nonce')
+        ));
+    }
+}
+
 // Add admin menu for CSV upload and featured image import
 add_action('admin_menu', 'fospibay_add_admin_menu');
 function fospibay_add_admin_menu() {
@@ -34,6 +56,133 @@ function fospibay_add_admin_menu() {
 
 // Admin page for uploading CSV (main import)
 function fospibay_csv_import_page() {
+    // Inline JavaScript as fallback if file doesn't load
+    ?>
+    <script>
+    // Inline fallback functions
+    if (typeof startProgressMonitoring === 'undefined') {
+        window.startProgressMonitoring = function() {
+            console.log('Starting progress monitoring (inline)...');
+            let retryCount = 0;
+            const maxRetries = 5;
+            const ajaxUrl = '<?php echo admin_url('admin-ajax.php'); ?>';
+
+            const checkProgress = setInterval(function() {
+                fetch(ajaxUrl + '?action=fospibay_check_import_progress')
+                .then(response => response.json())
+                .then(data => {
+                    console.log('Progress data:', data);
+                    retryCount = 0;
+
+                    if (data.success) {
+                        updateProgressDisplay(data.data);
+                        if (data.data.completed) {
+                            clearInterval(checkProgress);
+                            document.getElementById('import-status').innerHTML = '<span style="color: green;">✓ Importación completada</span>';
+                            showImportSummary(data.data);
+                        }
+                    }
+                })
+                .catch(error => {
+                    console.error('Error checking progress:', error);
+                    retryCount++;
+                    if (retryCount >= maxRetries) {
+                        clearInterval(checkProgress);
+                        document.getElementById('import-status').innerHTML = '<span style="color: red;">Error: No se pudo conectar</span>';
+                    }
+                });
+            }, 2000);
+        };
+
+        window.updateProgressDisplay = function(data) {
+            console.log('Updating display:', data);
+            const progress = data.total_rows > 0 ? ((data.row_index - 2) / (data.total_rows - 1)) * 100 : 0;
+            const progressBar = document.getElementById('progress-bar');
+            const progressText = document.getElementById('progress-text');
+
+            if (progressBar && progressText) {
+                progressBar.style.width = Math.min(100, Math.max(0, progress)) + '%';
+                progressText.textContent = Math.round(Math.min(100, Math.max(0, progress))) + '%';
+            }
+
+            const elements = {
+                'rows-processed': Math.max(0, data.row_index - 2),
+                'total-rows': Math.max(0, data.total_rows - 1),
+                'posts-created': data.imported || 0,
+                'posts-updated': data.updated || 0,
+                'posts-skipped': data.skipped || 0,
+                'images-downloaded': data.images_downloaded || 0,
+                'import-status': data.status || 'Procesando...',
+                'last-title': data.current_title || '-'
+            };
+
+            for (const [id, value] of Object.entries(elements)) {
+                const element = document.getElementById(id);
+                if (element) {
+                    element.textContent = value;
+                }
+            }
+        };
+
+        window.showImportSummary = function(data) {
+            const summaryHtml = `
+                <div style="background: #d4edda; border: 1px solid #c3e6cb; padding: 15px; margin-top: 20px; border-radius: 5px;">
+                    <h3 style="color: #155724; margin-top: 0;">✓ Resumen de Importación Completada</h3>
+                    <ul style="color: #155724;">
+                        <li><strong>${data.imported}</strong> entradas creadas</li>
+                        <li><strong>${data.updated}</strong> entradas actualizadas</li>
+                        <li><strong>${data.skipped}</strong> entradas omitidas</li>
+                        <li><strong>${data.images_downloaded || 0}</strong> imágenes descargadas</li>
+                    </ul>
+                </div>
+            `;
+            document.getElementById('import-progress-container').insertAdjacentHTML('beforeend', summaryHtml);
+        };
+
+        window.processDirectly = function() {
+            const form = document.querySelector('form');
+            if (form) {
+                const input = document.createElement('input');
+                input.type = 'hidden';
+                input.name = 'process_direct';
+                input.value = '1';
+                form.appendChild(input);
+                form.submit();
+            }
+        };
+
+        window.processNextBatchDirectly = function() {
+            const ajaxUrl = '<?php echo admin_url('admin-ajax.php'); ?>';
+            fetch(ajaxUrl, {
+                method: 'POST',
+                headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+                body: 'action=fospibay_process_batch_ajax'
+            })
+            .then(response => response.json())
+            .then(data => {
+                console.log('Batch processed:', data);
+                fetch(ajaxUrl + '?action=fospibay_check_import_progress')
+                .then(response => response.json())
+                .then(progressData => {
+                    if (progressData.success) {
+                        updateProgressDisplay(progressData.data);
+                        if (!progressData.data.completed) {
+                            setTimeout(() => { processNextBatchDirectly(); }, 1000);
+                        } else {
+                            document.getElementById('import-status').innerHTML = '<span style="color: green;">✓ Importación completada</span>';
+                            showImportSummary(progressData.data);
+                        }
+                    }
+                });
+            })
+            .catch(error => {
+                console.error('Error processing batch:', error);
+                document.getElementById('import-status').innerHTML = '<span style="color: red;">Error al procesar lote</span>';
+            });
+        };
+    }
+    </script>
+    <?php
     ?>
     <div class="wrap">
         <h1>Fospibay CSV Import</h1>
@@ -177,12 +326,26 @@ function fospibay_csv_import_page() {
                     echo '<div class="updated"><p>Importación del archivo local iniciada. Total de filas a procesar: ' . $total_rows . '</p></div>';
                 }
                 echo '<script>
-                    document.getElementById("import-progress-container").style.display = "block";
-                    document.getElementById("total-rows").textContent = "' . $total_rows . '";
-                    if (document.getElementById("debug_mode") && document.getElementById("debug_mode").checked) {
-                        document.getElementById("debug-output").style.display = "block";
-                    }
-                    startProgressMonitoring();
+                    // Wait for DOM and functions to be ready
+                    document.addEventListener("DOMContentLoaded", function() {
+                        document.getElementById("import-progress-container").style.display = "block";
+                        document.getElementById("total-rows").textContent = "' . $total_rows . '";
+                        if (document.getElementById("debug_mode") && document.getElementById("debug_mode").checked) {
+                            document.getElementById("debug-output").style.display = "block";
+                        }
+                        if (typeof startProgressMonitoring === "function") {
+                            startProgressMonitoring();
+                        } else {
+                            console.error("startProgressMonitoring not found - trying again in 1 second");
+                            setTimeout(function() {
+                                if (typeof startProgressMonitoring === "function") {
+                                    startProgressMonitoring();
+                                } else {
+                                    console.error("startProgressMonitoring still not found");
+                                }
+                            }, 1000);
+                        }
+                    });
                 </script>';
             }
         }
@@ -229,12 +392,26 @@ function fospibay_csv_import_page() {
 
             echo '<div class="updated"><p>Importación iniciada. Total de filas a procesar: ' . $total_rows . '</p></div>';
             echo '<script>
-                document.getElementById("import-progress-container").style.display = "block";
-                document.getElementById("total-rows").textContent = "' . $total_rows . '";
-                if (document.getElementById("debug_mode") && document.getElementById("debug_mode").checked) {
-                    document.getElementById("debug-output").style.display = "block";
-                }
-                startProgressMonitoring();
+                // Wait for DOM and functions to be ready
+                document.addEventListener("DOMContentLoaded", function() {
+                    document.getElementById("import-progress-container").style.display = "block";
+                    document.getElementById("total-rows").textContent = "' . $total_rows . '";
+                    if (document.getElementById("debug_mode") && document.getElementById("debug_mode").checked) {
+                        document.getElementById("debug-output").style.display = "block";
+                    }
+                    if (typeof startProgressMonitoring === "function") {
+                        startProgressMonitoring();
+                    } else {
+                        console.error("startProgressMonitoring not found - trying again in 1 second");
+                        setTimeout(function() {
+                            if (typeof startProgressMonitoring === "function") {
+                                startProgressMonitoring();
+                            } else {
+                                console.error("startProgressMonitoring still not found");
+                            }
+                        }, 1000);
+                    }
+                });
             </script>';
         }
         ?>
