@@ -42,6 +42,30 @@ function fospibay_csv_import_page() {
             <p>Este importador es compatible con el formato de exportación de WordPress/Elementor.</p>
             <p><strong>Nota:</strong> Se ha mejorado el manejo de caracteres especiales y codificación UTF-8.</p>
         </div>
+
+        <!-- Progress Bar Section -->
+        <div id="import-progress-container" style="display: none; margin: 20px 0; padding: 20px; background: #fff; border: 1px solid #ccc; border-radius: 5px;">
+            <h3>Progreso de Importación</h3>
+            <div style="background: #f0f0f0; height: 30px; border-radius: 15px; overflow: hidden; margin: 10px 0;">
+                <div id="progress-bar" style="background: #0073aa; height: 100%; width: 0%; transition: width 0.3s; display: flex; align-items: center; justify-content: center; color: white; font-weight: bold;">
+                    <span id="progress-text">0%</span>
+                </div>
+            </div>
+            <div id="import-stats" style="margin-top: 15px;">
+                <p><strong>Estado:</strong> <span id="import-status">Iniciando...</span></p>
+                <p><strong>Filas procesadas:</strong> <span id="rows-processed">0</span> / <span id="total-rows">0</span></p>
+                <p><strong>Entradas creadas:</strong> <span id="posts-created">0</span></p>
+                <p><strong>Entradas actualizadas:</strong> <span id="posts-updated">0</span></p>
+                <p><strong>Omitidas:</strong> <span id="posts-skipped">0</span></p>
+                <p><strong>Imágenes descargadas:</strong> <span id="images-downloaded">0</span></p>
+                <p><strong>Último título procesado:</strong> <span id="last-title" style="font-style: italic;">-</span></p>
+            </div>
+            <div id="debug-output" style="margin-top: 15px; padding: 10px; background: #f9f9f9; border: 1px solid #ddd; border-radius: 3px; max-height: 300px; overflow-y: auto; font-family: monospace; font-size: 12px; display: none;">
+                <strong>Debug Output:</strong>
+                <div id="debug-messages"></div>
+            </div>
+            <button type="button" class="button" onclick="location.reload();">Recargar Página</button>
+        </div>
         <?php
         $state = get_option('fospibay_import_state', false);
         if ($state && file_exists($state['file'])) {
@@ -77,7 +101,14 @@ function fospibay_csv_import_page() {
             </p>
             <p>
                 <label for="batch_size">Tamaño del lote (filas por lote):</label><br>
-                <input type="number" name="batch_size" id="batch_size" value="50" min="1" max="1000">
+                <input type="number" name="batch_size" id="batch_size" value="5" min="1" max="1000">
+                <small>Valores más bajos permiten mejor seguimiento del progreso</small>
+            </p>
+            <p>
+                <label for="debug_mode">
+                    <input type="checkbox" name="debug_mode" id="debug_mode" value="1" checked>
+                    Activar modo debug (muestra información detallada)
+                </label>
             </p>
             <p>
                 <label for="delimiter">Delimitador CSV:</label><br>
@@ -106,6 +137,7 @@ function fospibay_csv_import_page() {
                 $batch_size = isset($_POST['batch_size']) ? max(1, min(1000, absint($_POST['batch_size']))) : 50;
                 $delimiter = ','; // Default to comma for export files
 
+                $total_rows = fospibay_count_csv_rows($csv_path, $delimiter);
                 update_option('fospibay_import_state', [
                     'file' => $csv_path,
                     'row_index' => 2,
@@ -115,10 +147,23 @@ function fospibay_csv_import_page() {
                     'batch_size' => $batch_size,
                     'skip_existing' => $skip_existing,
                     'delimiter' => $delimiter,
-                    'offset' => 0
+                    'offset' => 0,
+                    'debug_mode' => isset($_POST['debug_mode']) && $_POST['debug_mode'] == '1',
+                    'total_rows' => $total_rows,
+                    'images_downloaded' => 0,
+                    'current_title' => '',
+                    'debug_messages' => []
                 ]);
                 wp_schedule_single_event(time(), 'fospibay_process_batch');
-                echo '<div class="updated"><p>Importación del archivo local iniciada. Consulta el log en <code>' . esc_html(WP_CONTENT_DIR . '/fospibay-import-log.txt') . '</code> o espera a que finalice.</p></div>';
+                echo '<div class="updated"><p>Importación del archivo local iniciada. Total de filas a procesar: ' . $total_rows . '</p></div>';
+                echo '<script>
+                    document.getElementById("import-progress-container").style.display = "block";
+                    document.getElementById("total-rows").textContent = "' . $total_rows . '";
+                    if (document.getElementById("debug_mode") && document.getElementById("debug_mode").checked) {
+                        document.getElementById("debug-output").style.display = "block";
+                    }
+                    startProgressMonitoring();
+                </script>';
             }
         }
         // Handle file upload
@@ -136,6 +181,7 @@ function fospibay_csv_import_page() {
                 echo '<div class="error"><p>Error: El archivo CSV no tiene la estructura esperada. Verifique que contenga las columnas Title y Content.</p></div>';
                 return;
             }
+            $total_rows = fospibay_count_csv_rows($target_file, $delimiter);
             update_option('fospibay_import_state', [
                 'file' => $target_file,
                 'row_index' => 2,
@@ -145,14 +191,91 @@ function fospibay_csv_import_page() {
                 'batch_size' => $batch_size,
                 'skip_existing' => $skip_existing,
                 'delimiter' => $delimiter,
-                'offset' => 0
+                'offset' => 0,
+                'debug_mode' => isset($_POST['debug_mode']) && $_POST['debug_mode'] == '1',
+                'total_rows' => $total_rows,
+                'images_downloaded' => 0,
+                'current_title' => '',
+                'debug_messages' => []
             ]);
             wp_schedule_single_event(time(), 'fospibay_process_batch');
-            echo '<div class="updated"><p>Importación iniciada en segundo plano. Consulta el log en <code>' . esc_html(WP_CONTENT_DIR . '/fospibay-import-log.txt') . '</code> o espera a que finalice.</p></div>';
+            echo '<div class="updated"><p>Importación iniciada. Total de filas a procesar: ' . $total_rows . '</p></div>';
+            echo '<script>
+                document.getElementById("import-progress-container").style.display = "block";
+                document.getElementById("total-rows").textContent = "' . $total_rows . '";
+                if (document.getElementById("debug_mode") && document.getElementById("debug_mode").checked) {
+                    document.getElementById("debug-output").style.display = "block";
+                }
+                startProgressMonitoring();
+            </script>';
         }
         ?>
         <p>Consulta el archivo de log en <code><?php echo esc_html(WP_CONTENT_DIR . '/fospibay-import-log.txt'); ?></code> para detalles de la importación.</p>
     </div>
+
+    <script>
+    function startProgressMonitoring() {
+        const checkProgress = setInterval(function() {
+            fetch('<?php echo admin_url('admin-ajax.php'); ?>?action=fospibay_check_import_progress&_wpnonce=<?php echo wp_create_nonce('fospibay_progress'); ?>')
+            .then(response => response.json())
+            .then(data => {
+                if (data.success) {
+                    updateProgressDisplay(data.data);
+                    if (data.data.completed) {
+                        clearInterval(checkProgress);
+                        document.getElementById('import-status').innerHTML = '<span style="color: green;">✓ Importación completada</span>';
+                        showImportSummary(data.data);
+                    }
+                }
+            })
+            .catch(error => {
+                console.error('Error checking progress:', error);
+            });
+        }, 2000); // Check every 2 seconds
+    }
+
+    function updateProgressDisplay(data) {
+        const progress = data.total_rows > 0 ? ((data.row_index - 2) / (data.total_rows - 1)) * 100 : 0;
+        document.getElementById('progress-bar').style.width = Math.min(100, progress) + '%';
+        document.getElementById('progress-text').textContent = Math.round(Math.min(100, progress)) + '%';
+        document.getElementById('rows-processed').textContent = Math.max(0, data.row_index - 2);
+        document.getElementById('total-rows').textContent = Math.max(0, data.total_rows - 1);
+        document.getElementById('posts-created').textContent = data.imported || 0;
+        document.getElementById('posts-updated').textContent = data.updated || 0;
+        document.getElementById('posts-skipped').textContent = data.skipped || 0;
+        document.getElementById('images-downloaded').textContent = data.images_downloaded || 0;
+        document.getElementById('import-status').textContent = data.status || 'Procesando...';
+        document.getElementById('last-title').textContent = data.current_title || '-';
+
+        // Add debug messages
+        if (data.debug_messages && data.debug_messages.length > 0) {
+            const debugDiv = document.getElementById('debug-messages');
+            if (debugDiv) {
+                data.debug_messages.forEach(msg => {
+                    const msgElement = document.createElement('div');
+                    msgElement.innerHTML = msg;
+                    debugDiv.appendChild(msgElement);
+                    debugDiv.scrollTop = debugDiv.scrollHeight;
+                });
+            }
+        }
+    }
+
+    function showImportSummary(data) {
+        const summaryHtml = `
+            <div style="background: #d4edda; border: 1px solid #c3e6cb; padding: 15px; margin-top: 20px; border-radius: 5px;">
+                <h3 style="color: #155724; margin-top: 0;">✓ Resumen de Importación Completada</h3>
+                <ul style="color: #155724;">
+                    <li><strong>${data.imported}</strong> entradas creadas</li>
+                    <li><strong>${data.updated}</strong> entradas actualizadas</li>
+                    <li><strong>${data.skipped}</strong> entradas omitidas</li>
+                    <li><strong>${data.images_downloaded || 0}</strong> imágenes descargadas</li>
+                </ul>
+            </div>
+        `;
+        document.getElementById('import-progress-container').insertAdjacentHTML('beforeend', summaryHtml);
+    }
+    </script>
     <?php
 }
 
@@ -403,6 +526,72 @@ function fospibay_import_featured_images($file_path, $delimiter) {
     fospibay_log_error('Importación de imágenes destacadas completada. Entradas actualizadas: ' . $updated . ', omitidas: ' . $skipped);
 }
 
+// AJAX handler for progress checking
+add_action('wp_ajax_fospibay_check_import_progress', 'fospibay_ajax_check_progress');
+function fospibay_ajax_check_progress() {
+    if (!isset($_GET['_wpnonce']) || !wp_verify_nonce($_GET['_wpnonce'], 'fospibay_progress')) {
+        wp_die('Nonce verification failed');
+    }
+
+    $state = get_option('fospibay_import_state', false);
+    if (!$state) {
+        wp_send_json_success([
+            'completed' => true,
+            'imported' => 0,
+            'updated' => 0,
+            'skipped' => 0,
+            'row_index' => 0,
+            'total_rows' => 0,
+            'status' => 'No hay importación activa'
+        ]);
+        return;
+    }
+
+    $completed = !file_exists($state['file']) || ($state['row_index'] >= ($state['total_rows'] ?? 0));
+
+    // Get recent debug messages
+    $debug_messages = [];
+    if (!empty($state['debug_mode']) && !empty($state['debug_messages'])) {
+        $debug_messages = array_slice($state['debug_messages'], -5); // Last 5 messages
+    }
+
+    wp_send_json_success([
+        'completed' => $completed,
+        'imported' => $state['imported'] ?? 0,
+        'updated' => $state['updated'] ?? 0,
+        'skipped' => $state['skipped'] ?? 0,
+        'row_index' => $state['row_index'] ?? 2,
+        'total_rows' => $state['total_rows'] ?? 0,
+        'images_downloaded' => $state['images_downloaded'] ?? 0,
+        'current_title' => $state['current_title'] ?? '',
+        'status' => $completed ? 'Completado' : 'Procesando lote...',
+        'debug_messages' => $debug_messages
+    ]);
+}
+
+// Count total rows in CSV
+function fospibay_count_csv_rows($file_path, $delimiter = ',') {
+    if (!file_exists($file_path) || !is_readable($file_path)) {
+        return 0;
+    }
+
+    $row_count = 0;
+    $handle = fopen($file_path, 'r');
+
+    // Detect and skip BOM
+    $bom = fread($handle, 3);
+    if ($bom !== "\xEF\xBB\xBF") {
+        rewind($handle);
+    }
+
+    while (fgetcsv($handle, 0, $delimiter, '"', '\\') !== false) {
+        $row_count++;
+    }
+
+    fclose($handle);
+    return $row_count;
+}
+
 // Process a batch of CSV rows (main import)
 add_action('fospibay_process_batch', 'fospibay_process_batch');
 function fospibay_process_batch() {
@@ -568,6 +757,11 @@ function fospibay_process_batch() {
         }
         fospibay_log_error('Datos de la fila ' . $row_index . ': ' . wp_json_encode($data));
 
+        // Update current title for progress display
+        if (isset($data['Title'])) {
+            $state['current_title'] = substr($data['Title'], 0, 100);
+        }
+
         $title = isset($data['Title']) ? trim($data['Title']) : '';
         $content = isset($data['Content']) ? trim($data['Content']) : '';
         $title_empty = empty($title);
@@ -643,6 +837,14 @@ function fospibay_process_batch() {
             $updated++;
         } else {
             $imported++;
+            fospibay_log_error('NUEVA ENTRADA CREADA: ID ' . $post_id . ' - Título: ' . $post_title);
+
+            // Add debug message
+            if (!empty($state['debug_mode'])) {
+                $state['debug_messages'][] = '<span style="color: green;">✓ Creada entrada ID ' . $post_id . ': ' . htmlspecialchars($post_title) . '</span>';
+                // Keep only last 20 messages
+                $state['debug_messages'] = array_slice($state['debug_messages'], -20);
+            }
         }
 
         // Process categories
@@ -665,18 +867,20 @@ function fospibay_process_batch() {
             }
         }
 
-        fospibay_clean_and_import_images($post_id, $data, $featured_image_header, $elementor_data_header);
+        $images_count = fospibay_clean_and_import_images($post_id, $data, $featured_image_header, $elementor_data_header, $state);
+        if ($images_count > 0) {
+            $state['images_downloaded'] = ($state['images_downloaded'] ?? 0) + $images_count;
+        }
         $row_index++;
         $processed++;
         $batch[] = $row;
 
-        update_option('fospibay_import_state', array_merge($state, [
-            'row_index' => $row_index,
-            'imported' => $imported,
-            'updated' => $updated,
-            'skipped' => $skipped,
-            'offset' => ftell($file_handle)
-        ]));
+        $state['row_index'] = $row_index;
+        $state['imported'] = $imported;
+        $state['updated'] = $updated;
+        $state['skipped'] = $skipped;
+        $state['offset'] = ftell($file_handle);
+        update_option('fospibay_import_state', $state);
     }
 
     fospibay_log_error('Lote ' . $batch_number . ' procesado. Filas procesadas: ' . count($batch) . ', Creadas: ' . $imported . ', Actualizadas: ' . $updated . ', Omitidas: ' . $skipped);
@@ -694,7 +898,8 @@ function fospibay_process_batch() {
 }
 
 // Clean content and import images
-function fospibay_clean_and_import_images($post_id, $data, $featured_image_header, $elementor_data_header) {
+function fospibay_clean_and_import_images($post_id, $data, $featured_image_header, $elementor_data_header, &$state = null) {
+    $images_downloaded = 0;
     $content = get_post_field('post_content', $post_id);
     $content = preg_replace('/<!-- wp:[a-z\/]+ -->/', '', $content);
     $content = preg_replace('/<!-- \/wp:[a-z\/]+ -->/', '', $content);
@@ -721,8 +926,14 @@ function fospibay_clean_and_import_images($post_id, $data, $featured_image_heade
                         wp_update_attachment_metadata($featured_image_id, $attachment_data);
                     }
                     set_post_thumbnail($post_id, $featured_image_id);
+                    $images_downloaded++;
+                    fospibay_log_error('IMAGEN DESTACADA ASIGNADA: ID ' . $featured_image_id . ' para entrada ID ' . $post_id);
                 }
+            } else {
+                fospibay_log_error('ERROR: No se pudo descargar/asignar imagen destacada para entrada ID ' . $post_id);
             }
+        } else {
+            fospibay_log_error('URL de imagen destacada inválida o vacía para entrada ID ' . $post_id);
         }
     }
 
@@ -742,6 +953,9 @@ function fospibay_clean_and_import_images($post_id, $data, $featured_image_heade
                                 $image_id = $existing_image_id ?: fospibay_download_and_attach_image($image['url'], $post_id);
                                 if ($image_id && !is_wp_error($image_id)) {
                                     $all_gallery_image_ids[] = $image_id;
+                                    if (!$existing_image_id) {
+                                        $images_downloaded++;
+                                    }
                                 }
                             }
                         }
@@ -753,6 +967,8 @@ function fospibay_clean_and_import_images($post_id, $data, $featured_image_heade
             }
         }
     }
+
+    return $images_downloaded;
 }
 
 // Download and attach an image to the media library
