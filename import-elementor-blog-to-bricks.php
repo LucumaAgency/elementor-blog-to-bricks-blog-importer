@@ -214,13 +214,18 @@ function fospibay_csv_import_page() {
                 <div id="debug-messages"></div>
             </div>
             <button type="button" class="button" onclick="location.reload();">Recargar Página</button>
+            <?php if ($state = get_option('fospibay_import_state', false)) : ?>
+                <button type="button" class="button button-secondary" onclick="if(confirm('¿Cancelar importación actual?')) { fetch('<?php echo admin_url('admin-ajax.php'); ?>?action=fospibay_cancel_import').then(() => location.reload()); }">Cancelar Importación</button>
+            <?php endif; ?>
         </div>
         <?php
         $state = get_option('fospibay_import_state', false);
         if ($state && file_exists($state['file'])) {
-            echo '<div class="notice notice-info"><p>Importación previa interrumpida en fila ' . esc_html($state['row_index']) . '. <a href="' . esc_url(add_query_arg('resume_import', '1')) . '">Reanudar</a> o <a href="' . esc_url(add_query_arg('cancel_import', '1')) . '">Cancelar</a></p></div>';
+            $cancel_url = wp_nonce_url(add_query_arg('cancel_import', '1'), 'fospibay_cancel_import');
+            $resume_url = wp_nonce_url(add_query_arg('resume_import', '1'), 'fospibay_resume_import');
+            echo '<div class="notice notice-info"><p>Importación previa interrumpida en fila ' . esc_html($state['row_index']) . '. <a href="' . esc_url($resume_url) . '">Reanudar</a> o <a href="' . esc_url($cancel_url) . '">Cancelar</a></p></div>';
         }
-        if (isset($_GET['cancel_import']) && wp_verify_nonce($_GET['_wpnonce'], 'fospibay_cancel_import')) {
+        if (isset($_GET['cancel_import']) && isset($_GET['_wpnonce']) && wp_verify_nonce($_GET['_wpnonce'], 'fospibay_cancel_import')) {
             unlink($state['file']);
             delete_option('fospibay_import_state');
             echo '<div class="updated"><p>Importación cancelada.</p></div>';
@@ -900,6 +905,21 @@ function fospibay_count_csv_rows($file_path, $delimiter = ',') {
     return $row_count;
 }
 
+// AJAX handler for canceling import
+add_action('wp_ajax_fospibay_cancel_import', 'fospibay_cancel_import_ajax');
+function fospibay_cancel_import_ajax() {
+    $state = get_option('fospibay_import_state', false);
+    if ($state) {
+        if (isset($state['file']) && file_exists($state['file'])) {
+            unlink($state['file']);
+        }
+        delete_option('fospibay_import_state');
+        wp_send_json_success(['message' => 'Import cancelled']);
+    } else {
+        wp_send_json_error('No active import to cancel');
+    }
+}
+
 // AJAX handler for direct batch processing
 add_action('wp_ajax_fospibay_process_batch_ajax', 'fospibay_process_batch_ajax');
 function fospibay_process_batch_ajax() {
@@ -949,6 +969,10 @@ function fospibay_process_batch() {
     ini_set('default_charset', 'UTF-8');
 
     $file_handle = fopen($file_path, 'r');
+
+    // Debug: log initial state
+    fospibay_log_error('Estado inicial - Offset: ' . $offset . ', Row Index: ' . $row_index . ', Headers en estado: ' . (isset($state['headers']) ? 'Sí' : 'No'));
+
     if ($offset === 0) {
         // Detect and handle BOM
         $bom = fread($file_handle, 3);
@@ -1033,19 +1057,33 @@ function fospibay_process_batch() {
         $state['featured_image_header'] = $featured_image_header;
         $state['elementor_data_header'] = $elementor_data_header;
         $state['categories_header'] = $categories_header;
+        // Save the current file position after reading headers
+        $offset = ftell($file_handle);  // Update offset variable for current execution
+        $state['offset'] = $offset;
+        fospibay_log_error('Offset después de leer headers: ' . $offset);
         update_option('fospibay_import_state', $state);
+
+        // After reading headers, close file and schedule next batch
+        fclose($file_handle);
+        fospibay_log_error('Headers procesados. Programando siguiente batch para procesar datos...');
+        wp_schedule_single_event(time() + 1, 'fospibay_process_batch');
+        return; // Exit early to process data in next batch
     } else {
+        fospibay_log_error('Reanudando desde offset: ' . $offset . ', fila: ' . $row_index);
         fseek($file_handle, $offset);
         $headers = $state['headers'];
         $header_map = $state['header_map'];
         $featured_image_header = $state['featured_image_header'];
         $elementor_data_header = $state['elementor_data_header'];
         $categories_header = $state['categories_header'];
+        fospibay_log_error('Headers recuperados: ' . implode(', ', $headers));
     }
 
     $batch = [];
     $processed = 0;
     $max_execution_time = ini_get('max_execution_time') ?: 30;
+
+    fospibay_log_error('Iniciando lectura del CSV. Processed: ' . $processed . ', Batch size: ' . $batch_size);
 
     while ($processed < $batch_size && ($row = fgetcsv($file_handle, 0, $delimiter, '"', '\\')) !== false) {
         // Check execution time (use 80% of max to be safe)
@@ -1210,9 +1248,21 @@ function fospibay_process_batch() {
     }
 
     fospibay_log_error('Lote ' . $batch_number . ' procesado. Filas procesadas en este lote: ' . $processed . ', Total acumulado - Creadas: ' . $imported . ', Actualizadas: ' . $updated . ', Omitidas: ' . $skipped . ', Posición actual: ' . $row_index . '/' . ($state['total_rows'] ?? 'desconocido'));
+
+    // Debug: Check if we reached EOF
+    $is_eof = feof($file_handle);
+    $current_position = ftell($file_handle);
+    fospibay_log_error('Estado del archivo - EOF: ' . ($is_eof ? 'true' : 'false') . ', Posición actual: ' . $current_position . ', Offset guardado: ' . $offset);
+
+    // If no rows were processed and we're not at the beginning, we might be done
+    if ($processed == 0 && $row_index > 2) {
+        fospibay_log_error('No se procesaron filas en este lote y row_index > 2. Verificando si hemos terminado...');
+        $is_eof = true;  // Force EOF
+    }
+
     wp_cache_flush();
 
-    if (!feof($file_handle)) {
+    if (!$is_eof) {
         wp_schedule_single_event(time() + 1, 'fospibay_process_batch');
 
         // Try to trigger cron immediately
